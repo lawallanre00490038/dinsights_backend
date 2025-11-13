@@ -2,7 +2,7 @@ pandas
 streamlit
 scikit-learn
 plotly
-langchain_groq
+langchain-groq
 
 langgraph==1.0.2
 langchain==1.0.3
