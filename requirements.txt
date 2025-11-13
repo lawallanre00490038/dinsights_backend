@@ -1,0 +1,16 @@
+pandas
+streamlit
+scikit-learn
+plotly
+
+langgraph==1.0.2
+langchain==1.0.3
+langchain-core==1.0.3
+langchain-openai==1.0.2
+
+python-dotenv
+langchain-experimental
+
+fastapi 
+uvicorn
+numpy
