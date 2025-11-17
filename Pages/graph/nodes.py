@@ -48,6 +48,10 @@ def route_to_tools(
     Use in the conditional_edge to route to the ToolNode if the last message
     has tool calls. Otherwise, end the graph.
     """
+    # Safety check: if we've made too many tool calls, force end to prevent infinite loops
+    tool_call_count = state.get("tool_call_count", 0)
+    if tool_call_count >= 5:  # Max 5 tool call iterations
+        return "__end__"
 
     if messages := state.get("messages", []):
         ai_message = messages[-1]
@@ -165,6 +169,10 @@ def call_tools(state: AgentState):
     last_message = state["messages"][-1]
     tool_messages = []
     state_updates = {}
+    
+    # Increment tool call count
+    current_count = state.get("tool_call_count", 0)
+    state_updates["tool_call_count"] = current_count + 1
 
     if isinstance(last_message, AIMessage) and hasattr(last_message, "tool_calls"):
         for tc in last_message.tool_calls:
@@ -196,7 +204,8 @@ def call_tools(state: AgentState):
                     result_text = ""
 
                 failure_indicators = ["Column/DF hints", "not found", "not a valid file", "Traceback", "Error code:"]
-                if any(ind in result_text for ind in failure_indicators) and not auto_retry_done:
+                # Only retry if we haven't done so yet AND we haven't exceeded retry limit
+                if any(ind in result_text for ind in failure_indicators) and not auto_retry_done and current_count < 3:
                     # Prepare a failure message including the intermediate outputs (if present)
                     failure_hint = result_text
                     # Create a compact data summary to help the model correct column names
@@ -230,6 +239,6 @@ def call_tools(state: AgentState):
                     # mark that we've attempted an automated retry so we don't loop
                     state_updates["auto_retry_done"] = True
 
-    state_updates["messages"] = state["messages"] + tool_messages
+    state_updates["messages"] = tool_messages
     
     return state_updates

@@ -11,5 +11,6 @@ class AgentState(TypedDict):
     intermediate_outputs: Annotated[List[dict], operator.add]
     current_variables: dict
     output_image_paths: Annotated[List[str], operator.add]
-
-
+    tool_suggestion_done: bool
+    auto_retry_done: bool
+    tool_call_count: int

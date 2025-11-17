@@ -27,6 +27,7 @@ class PythonChatbot:
 
         workflow.add_edge('tools', 'agent')
         workflow.set_entry_point('agent')
+        # Compile without config parameter - recursion_limit is set during invoke
         return workflow.compile()
 
     def user_sent_message(self, user_query, input_data: List[InputData]):
@@ -43,10 +44,13 @@ class PythonChatbot:
             "input_data": input_data,
             "intermediate_outputs": [],
             "current_variables": self.current_variables,
+            "tool_suggestion_done": False,
+            "auto_retry_done": False,
+            "tool_call_count": 0,
         }
 
         try:
-            result = self.graph.invoke(input_state)
+            result = self.graph.invoke(input_state, config={"recursion_limit": 50})
         except Exception as exc:
             # Capture diagnostic information so callers can return it to clients or logs
             err_msg = f"Graph invocation failed: {exc.__class__.__name__}: {exc}"
