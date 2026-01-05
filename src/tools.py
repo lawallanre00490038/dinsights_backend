@@ -269,7 +269,6 @@ def convert_plotly_pickles_to_json(image_paths: list) -> list:
 
 
 
-
 # Initialize the language model
 llm = ChatGroq(
   model="llama-3.1-8b-instant",
