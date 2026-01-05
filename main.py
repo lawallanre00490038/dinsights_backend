@@ -22,6 +22,8 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Identifier used to persist conversation state across requests.")
     reset_session: bool = Field(False, description="If true, resets the state for the provided session_id before handling the request.")
 
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
 
@@ -130,6 +132,9 @@ async def chat_endpoint(request: ChatRequest):
                 "error": f"An internal server error occurred: {str(e)}"
             }
         )
+
+
+
 
 
 # Custom handler to avoid UnicodeDecodeError when validation errors include raw bytes
