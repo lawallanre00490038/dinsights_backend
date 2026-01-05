@@ -1,12 +1,16 @@
+from datetime import datetime
 from threading import Lock
-from typing import  Optional, List, Any
+from typing import  Optional, List, Any, Dict
 from uuid import uuid4
+import uuid
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
+from urllib.parse import urlparse
+import time, random, traceback
 from starlette.responses import JSONResponse
 
 from langgraph.prebuilt import tools_condition, ToolNode
@@ -14,7 +18,7 @@ from langgraph.graph import StateGraph, START
 
 import pandas as pd
 import json
-import re
+import re, io
 from langchain_core.messages import ToolMessage
 
 from src.injestion import store_file_and_register_dataset
@@ -22,24 +26,61 @@ from src.tools import describe_dataframe, llm_with_tool, load_csv, generate_char
 from src.state import AnalysisState
 from src.registry import DATASET_REGISTRY, update_dataset_access, cleanup_expired_datasets, get_registry_stats, delete_dataset
 from src.db import conn
+from src.utils.s3_config import download_file_from_s3
 
 # ----------------------------
 # ChatRequest definition
 # ----------------------------
 class InputData(BaseModel):
-    key: str
-    value: Any
-
+    variable_name: str
+    data_path: Optional[str] = None
+    data_description: Optional[str] = ""
+    fileId: Optional[str] = None
+    sourceType: Optional[str] = None
 
 class ChatRequest(BaseModel):
-    user_query: str
+    user_query: str = "Analyze the file"
+    session_id: Optional[str] = Field(None, description="Identifier used to persist conversation state across requests.")
+    reset_session: bool = False
     input_data: Optional[List[InputData]] = None
-    session_id: Optional[str] = Field(
-        None, description="Identifier used to persist conversation state across requests."
-    )
-    reset_session: bool = Field(
-        False, description="If true, resets the state for the provided session_id before handling the request."
-    )
+
+
+
+
+class ChatMessageResponse(BaseModel):
+    id: str
+    role: str  # "USER" | "ASSISTANT" | "SYSTEM"
+    content: str
+    charts: Optional[List[dict]] = Field(default_factory=list)
+    references: Optional[List[dict]] = Field(default_factory=list)
+    inputData: Optional[List[dict]] = Field(default_factory=list)
+    createdAt: datetime
+
+
+class ChatResponseSchema(BaseModel):
+    sessionId: str
+    messages: List[ChatMessageResponse]
+
+# New, separate message models so `USER` message does not include charts/inputData
+class UserMessage(BaseModel):
+    id: str
+    role: str  # "USER"
+    content: str
+    createdAt: datetime
+
+class AssistantMessage(BaseModel):
+    id: str
+    role: str  # "ASSISTANT"
+    content: str
+    charts: Optional[List[dict]] = Field(default_factory=list)
+    references: Optional[List[dict]] = Field(default_factory=list)
+    inputData: Optional[List[dict]] = Field(default_factory=list)
+    createdAt: datetime
+
+class ChatResponseV2(BaseModel):
+    sessionId: str
+    user: UserMessage
+    assistant: AssistantMessage
 
 
 # ----------------------------
@@ -51,6 +92,70 @@ app = FastAPI(
     version="1.0.0"
 )
 _session_lock = Lock()
+
+# Simple in-memory session store mapping session_id -> metadata (e.g., dataset_id)
+# This keeps the association between a frontend session and an uploaded dataset
+# so subsequent requests that omit `input_data` still operate on the same file.
+SESSION_STORE: Dict[str, dict] = {}
+
+
+def normalize_s3_path(s3_url: str) -> str:
+    """Convert various S3 URL formats into the expected "bucket/key" form.
+
+    Supported inputs:
+    - s3://bucket/key
+    - https://bucket.s3.<region>.amazonaws.com/key (virtual-hosted)
+    - https://s3.<region>.amazonaws.com/bucket/key (path-style)
+    - https://s3.amazonaws.com/bucket/key
+    """
+    if not s3_url:
+        return s3_url
+
+    if s3_url.startswith("s3://"):
+        return s3_url[len("s3://"):]
+
+    parsed = urlparse(s3_url)
+    host = parsed.netloc
+    path = parsed.path.lstrip("/")
+
+    # virtual-hosted style: bucket.s3.region.amazonaws.com
+    if ".s3." in host or host.endswith(".s3.amazonaws.com"):
+        bucket = host.split(".s3.")[0]
+        key = path
+        return f"{bucket}/{key}"
+
+    # path-style: s3.amazonaws.com/bucket/key or s3.region.amazonaws.com/bucket/key
+    if host.startswith("s3") or host.endswith("amazonaws.com"):
+        parts = path.split("/")
+        if len(parts) >= 2:
+            bucket = parts[0]
+            key = "/".join(parts[1:])
+            return f"{bucket}/{key}"
+
+    # Fallback: treat the full path after scheme as bucket/key
+    return path
+
+
+def retry_call(fn, attempts: int = 3, base_delay: float = 0.5, *args, **kwargs):
+    """Retry wrapper for transient errors.
+
+    fn can be a callable that accepts args/kwargs. Returns the function's result or raises the last exception.
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            # small jittered exponential backoff
+            if i == attempts - 1:
+                break
+            delay = base_delay * (2 ** i) + random.random() * 0.1
+            time.sleep(delay)
+    # raise the last exception
+    raise last_exc
+
+
 
 # Add rate limiting middleware
 from src.rate_limit import RateLimitMiddleware
@@ -290,80 +395,327 @@ graph.add_edge("extract_plots", "LLM")  # loop back to LLM after extracting plot
 graph = graph.compile()
 
 
+
+
+
+from fastapi import Body
+
+@app.post("/api/chat", response_model=ChatResponseV2)
+async def analyze_chat(request: ChatRequest = Body(...)):
+
+    try:
+        print(request)
+        # Determine session id early so we can persist/restore dataset association
+        session_id = request.session_id or str(uuid.uuid4())
+
+        # If requested, reset any session state
+        if request.reset_session and request.session_id:
+            with _session_lock:
+                SESSION_STORE.pop(request.session_id, None)
+
+        dataset_id = None
+
+        # Handle S3 file ingestion (new upload overrides stored dataset for session)
+        if request.input_data:
+            for item in request.input_data:
+                # support both dicts and Pydantic InputData objects
+                if isinstance(item, dict):
+                    s3_url = item.get("data_path")
+                else:
+                    s3_url = getattr(item, "data_path", None)
+
+                if s3_url:
+                    try:
+                        # normalize common S3 URL formats to "bucket/key"
+                        normalized = normalize_s3_path(s3_url)
+                        # download with retries
+                        file_content = retry_call(download_file_from_s3, 3, 0.5, normalized)
+                        file_like = UploadFile(filename=s3_url.split("/")[-1], file=io.BytesIO(file_content))
+                        dataset_id = store_file_and_register_dataset(file_like)
+                        # persist dataset_id for this session
+                        with _session_lock:
+                            SESSION_STORE[session_id] = {"dataset_id": dataset_id, "updated_at": datetime.utcnow().isoformat()}
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"S3 file ingestion error: {e}")
+        else:
+            # No input_data provided: try to restore dataset_id from session store
+            if request.session_id:
+                with _session_lock:
+                    sess = SESSION_STORE.get(request.session_id)
+                    if sess:
+                        dataset_id = sess.get("dataset_id")
+
+        if not request.user_query or not request.user_query.strip():
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        query = HumanMessage(content=request.user_query.strip())
+
+        # Invoke state graph with the (possibly restored) dataset_id
+        invoke_state = {
+            "messages": [query],
+            "saved_messages": [query],
+            "dataset_id": dataset_id,
+            "described": False,
+            "plots": []
+        }
+
+        try:
+            # attempt graph.invoke with retries to handle transient LLM/tool failures
+            result = retry_call(lambda state: graph.invoke(state), 3, 1.0, invoke_state)
+        except Exception as tool_err:
+            # Log the error and continue with a graceful assistant response
+            error_id = str(uuid.uuid4())
+            print(f"Graph invocation error (ref {error_id}): {tool_err}")
+            traceback.print_exc()
+            result = {"messages": [], "plots": []}
+            result = {"messages": [], "plots": []}
+
+            # Try to generate fallback charts directly on the server if a dataset is available
+            fallback_plots = []
+            try:
+                if dataset_id and dataset_id in DATASET_REGISTRY:
+                    table_name = DATASET_REGISTRY[dataset_id]["table"]
+                    df = conn.execute(f"SELECT * FROM {table_name}").df()
+
+                    numeric_cols = list(df.select_dtypes(include="number").columns)
+                    categorical_cols = list(df.select_dtypes(include="object").columns)
+
+                    # Attempt up to 3 fallback charts: bar, histogram, boxplot (when applicable)
+                    # 1) Bar: top categories by first numeric column
+                    if categorical_cols and numeric_cols:
+                        try:
+                            res = generate_chart(
+                                chart_type="bar",
+                                x_column=categorical_cols[0],
+                                y_column=numeric_cols[0],
+                                title=f"Top {categorical_cols[0]} by {numeric_cols[0]}",
+                                graph_state={"df": df},
+                            )
+                            # handle structured error result from generate_chart
+                            if isinstance(res, dict) and "plot" in res:
+                                fallback_plots.append(res["plot"])
+                            elif isinstance(res, dict) and res.get("error"):
+                                print(f"generate_chart returned error: {res}")
+                        except Exception as e:
+                            print(f"Fallback bar chart failed: {e}")
+
+                    # 2) Histogram: distribution of first numeric column
+                    if numeric_cols:
+                        try:
+                            res = generate_chart(
+                                chart_type="histogram",
+                                x_column=numeric_cols[0],
+                                title=f"Distribution of {numeric_cols[0]}",
+                                graph_state={"df": df},
+                            )
+                            if isinstance(res, dict) and "plot" in res:
+                                fallback_plots.append(res["plot"])
+                            elif isinstance(res, dict) and res.get("error"):
+                                print(f"generate_chart returned error: {res}")
+                        except Exception as e:
+                            print(f"Fallback histogram failed: {e}")
+
+                    # 3) Boxplot: numeric by category
+                    if categorical_cols and numeric_cols:
+                        try:
+                            res = generate_chart(
+                                chart_type="boxplot",
+                                x_column=categorical_cols[0],
+                                y_column=numeric_cols[0],
+                                title=f"Spread of {numeric_cols[0]} by {categorical_cols[0]}",
+                                graph_state={"df": df},
+                            )
+                            if isinstance(res, dict) and "plot" in res:
+                                fallback_plots.append(res["plot"])
+                            elif isinstance(res, dict) and res.get("error"):
+                                print(f"generate_chart returned error: {res}")
+                        except Exception as e:
+                            print(f"Fallback boxplot failed: {e}")
+
+            except Exception as e:
+                print(f"Fallback generation error: {e}")
+
+            # If we generated any fallback plots, attach them and set explanatory message
+            if fallback_plots:
+                result["plots"] = fallback_plots
+                message_content = (
+                    f"I couldn't complete the original tool-driven analysis (ref: {error_id}), but I generated some fallback visualizations from the uploaded dataset. "
+                    "See the charts attached."
+                )
+            else:
+                # Provide a concise, user-friendly explanation without leaking internals
+                message_content = (
+                    f"Sorry — I couldn't complete the analysis because a tool failed (ref: {error_id}). "
+                    "Please try again, or upload the dataset and retry."
+                )
+
+        # If message_content wasn't already set by a tool error, extract AI message content
+        if 'message_content' not in locals():
+            message_content = "Response generated."
+            for msg in reversed(result.get("messages", [])):
+                if isinstance(msg, AIMessage):
+                    has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+                    if not has_tool_calls:
+                        content = msg.content or "Response generated."
+                        content = re.sub(r'<function=[^>]+>.*?</function>', '', content, flags=re.DOTALL)
+                        content = re.sub(r'<function_calls>.*?</function_calls>', '', content, flags=re.DOTALL)
+                        message_content = content.strip() or "Response generated."
+                        break
+
+
+        # Generate IDs and timestamps
+        now_iso = datetime.utcnow().isoformat() + "Z"
+
+        # Minimal user_message (only id, role, content, createdAt)
+        user_message = {
+            "id": str(uuid.uuid4()),
+            "role": "USER",
+            "content": request.user_query.strip(),
+            "createdAt": now_iso
+        }
+
+        # Normalize input_data for response: convert Pydantic models to dicts
+        input_data_out = []
+        if request.input_data:
+            for i in request.input_data:
+                if hasattr(i, "dict"):
+                    input_data_out.append(i.dict())
+                else:
+                    input_data_out.append(i)
+
+        # Assistant message contains the chat info, charts, references and any inputData
+        assistant_message = {
+            "id": str(uuid.uuid4()),
+            "role": "ASSISTANT",
+            "content": message_content,
+            "charts": result.get("plots", []),
+            "references": [],
+            "inputData": input_data_out,
+            "createdAt": now_iso
+        }
+
+        # Return new typed response with separate user/assistant objects
+        return ChatResponseV2(
+            sessionId=session_id,
+            user=UserMessage(**user_message),
+            assistant=AssistantMessage(**assistant_message)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Catch-all: return a graceful assistant response instead of 500
+        error_id = str(uuid.uuid4())
+        print(f"Unhandled exception in /api/chat (ref {error_id}): {e}")
+        traceback.print_exc()
+        now_iso = datetime.utcnow().isoformat() + "Z"
+
+        user_message = {
+            "id": str(uuid.uuid4()),
+            "role": "USER",
+            "content": request.user_query.strip() if hasattr(request, 'user_query') else "",
+            "createdAt": now_iso
+        }
+
+        assistant_message = {
+            "id": str(uuid.uuid4()),
+            "role": "ASSISTANT",
+            "content": (
+                f"Sorry — an unexpected error occurred while processing your request (ref: {error_id}). "
+                "Please try again, or contact support if the problem persists."
+            ),
+            "charts": [],
+            "references": [],
+            "inputData": [],
+            "createdAt": now_iso
+        }
+
+        return ChatResponseV2(
+            sessionId=(request.session_id or str(uuid.uuid4())),
+            user=UserMessage(**user_message),
+            assistant=AssistantMessage(**assistant_message)
+        )
+
+
+
+
+
 # ----------------------------
 # API endpoints
 # ----------------------------
-@app.post("/api/chat")
-async def analyze(
-    prompt: str = Form(...),
-    file: UploadFile | None = File(None)
-):
-    try:
-        dataset_id = None
+# @app.post("/api/chat")
+# async def analyze(
+#     prompt: str = Form(...),
+#     file: UploadFile | None = File(None)
+# ):
+#     try:
+#         dataset_id = None
 
-        if file:
-            try:
-                dataset_id = store_file_and_register_dataset(file)
-            except HTTPException:
-                raise  # Re-raise HTTP exceptions from ingestion
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error processing uploaded file: {str(e)}"
-                )
+#         if file:
+#             try:
+#                 dataset_id = store_file_and_register_dataset(file)
+#             except HTTPException:
+#                 raise  # Re-raise HTTP exceptions from ingestion
+#             except Exception as e:
+#                 raise HTTPException(
+#                     status_code=500,
+#                     detail=f"Error processing uploaded file: {str(e)}"
+#                 )
 
-        if not prompt or not prompt.strip():
-            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+#         if not prompt or not prompt.strip():
+#             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-        query = HumanMessage(content=prompt.strip())
+#         query = HumanMessage(content=prompt.strip())
         
-        try:
-            result = graph.invoke({
-                "messages": [query],
-                "saved_messages": [query], 
-                "dataset_id": dataset_id,
-                "described" : False,
-                "plots": []
-            })
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error processing request: {str(e)}"
-            )
+#         try:
+#             result = graph.invoke({
+#                 "messages": [query],
+#                 "saved_messages": [query], 
+#                 "dataset_id": dataset_id,
+#                 "described" : False,
+#                 "plots": []
+#             })
+#         except Exception as e:
+#             raise HTTPException(
+#                 status_code=500,
+#                 detail=f"Error processing request: {str(e)}"
+#             )
 
-        print("\n\n\nsaved_messages", result.get("saved_messages", []))
+#         print("\n\n\nsaved_messages", result.get("saved_messages", []))
         
-        # Find the last AIMessage that is a final response (no tool calls)
-        # This will be the natural language explanation after tools have executed
-        messages = result.get("messages", [])
-        message_content = "Response generated."
+#         # Find the last AIMessage that is a final response (no tool calls)
+#         # This will be the natural language explanation after tools have executed
+#         messages = result.get("messages", [])
+#         message_content = "Response generated."
         
-        # Look backwards through messages to find the last AIMessage without tool calls
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage):
-                # Check if this AIMessage has tool calls
-                has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls and len(msg.tool_calls) > 0
-                if not has_tool_calls:
-                    # This is a final response without tool calls - use it
-                    content = msg.content if msg.content else "Response generated."
-                    # Clean up any function call syntax that might have leaked through
-                    # Remove patterns like <function=name>{...}</function>
-                    content = re.sub(r'<function=[^>]+>.*?</function>', '', content, flags=re.DOTALL)
-                    content = re.sub(r'<function_calls>.*?</function_calls>', '', content, flags=re.DOTALL)
-                    message_content = content.strip() if content.strip() else "Response generated."
-                    break
+#         # Look backwards through messages to find the last AIMessage without tool calls
+#         for msg in reversed(messages):
+#             if isinstance(msg, AIMessage):
+#                 # Check if this AIMessage has tool calls
+#                 has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls and len(msg.tool_calls) > 0
+#                 if not has_tool_calls:
+#                     # This is a final response without tool calls - use it
+#                     content = msg.content if msg.content else "Response generated."
+#                     # Clean up any function call syntax that might have leaked through
+#                     # Remove patterns like <function=name>{...}</function>
+#                     content = re.sub(r'<function=[^>]+>.*?</function>', '', content, flags=re.DOTALL)
+#                     content = re.sub(r'<function_calls>.*?</function_calls>', '', content, flags=re.DOTALL)
+#                     message_content = content.strip() if content.strip() else "Response generated."
+#                     break
         
-        return {
-            "messages": message_content,
-            "plots": result.get("plots", [])
-        }
-    except HTTPException:
-        raise  # Re-raise HTTP exceptions
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error: {str(e)}"
-        )
+#         return {
+#             "messages": message_content,
+#             "plots": result.get("plots", [])
+#         }
+#     except HTTPException:
+#         raise  # Re-raise HTTP exceptions
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=500,
+#             detail=f"Unexpected error: {str(e)}"
+#         )
 
 
 

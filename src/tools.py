@@ -85,74 +85,77 @@ def generate_chart(
     Returns:
         Dictionary with 'plot' (Plotly JSON spec) and 'message' (success message)
     """
-    df = graph_state.get("df")
-    if df is None:
-        raise ValueError("No dataset available.")
+    # Validate and prepare inputs
+    try:
+        df = graph_state.get("df")
+        if df is None:
+            return {"error": "NO_DATASET", "message": "No dataset available. Please upload a CSV file first."}
 
-    valid_columns = set(df.columns)
+        valid_columns = set(df.columns)
 
-    # Validate columns
-    for col in [x_column, y_column, color_column]:
-        if col and col not in valid_columns:
-            return {
-                "error": "INVALID_COLUMN",
-                "message": f"Column '{col}' does not exist.",
-                "valid_columns": list(valid_columns)
-            }
+        if not chart_type:
+            return {"error": "MISSING_ARG", "message": "chart_type is required."}
 
-    
+        for col in [x_column, y_column, color_column]:
+            if col and col not in valid_columns:
+                return {
+                    "error": "INVALID_COLUMN",
+                    "message": f"Column '{col}' does not exist.",
+                    "valid_columns": list(valid_columns)
+                }
+    except Exception as e:
+        return {"error": "INTERNAL", "message": f"Error preparing chart: {e}"}
+
     import plotly.express as px
-    import json
     import plotly.io as pio
-    
-    fig = None
-    chart_type = chart_type.lower()
 
-    if chart_type == "histogram" and not pd.api.types.is_numeric_dtype(df[x_column]):
-        chart_type = "bar"
-    
-    if chart_type == "bar":
-        # For bar charts, aggregate data if x_column is categorical to reduce verbosity
-        # This prevents sending thousands of individual data points
-        if x_column and y_column and not pd.api.types.is_numeric_dtype(df[x_column]) and pd.api.types.is_numeric_dtype(df[y_column]):
-            # Aggregate by x_column (sum by default for bar charts)
-            if color_column:
-                df_agg = df.groupby([x_column, color_column], as_index=False)[y_column].sum()
-                fig = px.bar(df_agg, x=x_column, y=y_column, color=color_column, title=title)
+    try:
+        chart_key = chart_type.lower()
+
+        # Histogram requires x_column and numeric data; fallback to bar if not numeric
+        if chart_key == "histogram":
+            if not x_column:
+                return {"error": "MISSING_ARG", "message": "x_column is required for histogram."}
+            if not pd.api.types.is_numeric_dtype(df[x_column]):
+                chart_key = "bar"
+
+        fig = None
+
+        if chart_key == "bar":
+            if x_column and y_column and (not pd.api.types.is_numeric_dtype(df[x_column])) and pd.api.types.is_numeric_dtype(df[y_column]):
+                if color_column:
+                    df_agg = df.groupby([x_column, color_column], as_index=False)[y_column].sum()
+                    fig = px.bar(df_agg, x=x_column, y=y_column, color=color_column, title=title)
+                else:
+                    df_agg = df.groupby(x_column, as_index=False)[y_column].sum()
+                    fig = px.bar(df_agg, x=x_column, y=y_column, title=title)
             else:
-                df_agg = df.groupby(x_column, as_index=False)[y_column].sum()
-                fig = px.bar(df_agg, x=x_column, y=y_column, title=title)
+                fig = px.bar(df, x=x_column, y=y_column, color=color_column, title=title)
+        elif chart_key == "line":
+            fig = px.line(df, x=x_column, y=y_column, color=color_column, title=title)
+        elif chart_key == "scatter":
+            fig = px.scatter(df, x=x_column, y=y_column, color=color_column, title=title)
+        elif chart_key == "histogram":
+            fig = px.histogram(df, x=x_column, color=color_column, title=title)
+        elif chart_key == "boxplot":
+            fig = px.box(df, x=x_column, y=y_column, color=color_column, title=title)
+        elif chart_key == "pie":
+            fig = px.pie(df, names=x_column, values=y_column, title=title)
         else:
-            fig = px.bar(df, x=x_column, y=y_column, color=color_column, title=title)
-    elif chart_type == "line":
-        fig = px.line(df, x=x_column, y=y_column, color=color_column, title=title)
-    elif chart_type == "scatter":
-        fig = px.scatter(df, x=x_column, y=y_column, color=color_column, title=title)
-    elif chart_type == "histogram":
-        fig = px.histogram(df, x=x_column, color=color_column, title=title)
-    elif chart_type == "boxplot":
-        fig = px.box(df, x=x_column, y=y_column, color=color_column, title=title)
-    elif chart_type == "pie":
-        fig = px.pie(df, names=x_column, values=y_column, title=title)
-    else:
-        raise ValueError(f"Unsupported chart type {chart_type}")
-    
-    fig.update_layout(template=None)
-    
-    # Use to_dict() instead of to_json() to get cleaner Python-native data structures
-    # This avoids base64 encoding issues
-    plot_dict = fig.to_dict()
-    
-    # Clean up the plot JSON for Plotly React
-    # Remove unnecessary fields and simplify structure
-    cleaned_plot = _clean_plotly_json(plot_dict)
-    
+            return {"error": "UNSUPPORTED_CHART", "message": f"Unsupported chart type {chart_type}"}
 
-    print(f"Generated {chart_type} chart")
-    return {
-        "plot": cleaned_plot, 
-        "message": f"{chart_type} chart generated successfully"
-    }
+        if fig is None:
+            return {"error": "INTERNAL", "message": "Failed to create figure."}
+
+        fig.update_layout(template=None)
+        plot_dict = fig.to_dict()
+        cleaned_plot = _clean_plotly_json(plot_dict)
+
+        print(f"Generated {chart_key} chart")
+        return {"plot": cleaned_plot, "message": f"{chart_key} chart generated successfully"}
+    except Exception as e:
+        print(f"generate_chart internal error: {e}")
+        return {"error": "INTERNAL", "message": f"Chart generation failed: {e}"}
 
 def _clean_plotly_json(plot_dict: dict) -> dict:
     """
@@ -225,48 +228,6 @@ def _clean_plotly_json(plot_dict: dict) -> dict:
 
 
 
-
-def convert_plotly_pickles_to_json(image_paths: list) -> list:
-    """
-    Reads Plotly figure pickle files and converts them into a list of
-    JSON-serializable dictionaries (Plotly JSON specification).
-    
-    Note: This function is kept for backward compatibility but may not be needed
-    if using the new generate_chart tool directly.
-    """
-    import pickle
-    import os
-    
-    chart_data_list = []
-    base_dir = "images/plotly_figures/pickle"
-
-    for filename in image_paths:
-        file_path = os.path.join(base_dir, filename)
-        
-        try:
-            # 1. Load the Plotly figure object from the pickle file
-            with open(file_path, 'rb') as f:
-                fig = pickle.load(f)
-
-            # 2. Remove the template from the figure object to make it more compact
-            fig.update_layout(template=None)
-
-            fig_dict = json.loads(pio.to_json(fig))
-            
-            chart_data_list.append(fig_dict)
-            
-        except Exception as e:
-            print(f"Error processing Plotly file {filename}: {e}")
-            continue
-    print(chart_data_list)
-    return chart_data_list
-
-
-
-
-
-
-
 # Initialize the language model
 llm = ChatGroq(
   model="llama-3.1-8b-instant",
@@ -276,4 +237,3 @@ llm = ChatGroq(
 # Bind tools to the LLM - this is required for the LLM to know about and call tools
 tools_list = [describe_dataframe, generate_chart]
 llm_with_tool = llm.bind_tools(tools_list)
-

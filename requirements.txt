@@ -18,3 +18,5 @@ numpy
 python-multipart
 
 duckdb
+botocore
+boto3
