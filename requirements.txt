@@ -15,5 +15,6 @@ langchain-experimental
 fastapi 
 uvicorn
 numpy
+python-multipart
 
 duckdb
