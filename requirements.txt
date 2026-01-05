@@ -18,5 +18,8 @@ numpy
 python-multipart
 
 duckdb
-botocore
 boto3
+openpyxl
+pyxlsb
+odfpy
+xlrd

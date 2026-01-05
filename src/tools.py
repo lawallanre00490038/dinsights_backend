@@ -11,6 +11,7 @@ import plotly.io as pio
 import json
 import pandas as pd
 from typing import Dict, Any, Annotated, Optional
+from pathlib import Path
 
 
 load_dotenv()
@@ -21,6 +22,44 @@ def load_csv(path: str) -> str:
     """Load a CSV file and return column info."""
     df = pd.read_csv(path)
     return f"Loaded CSV with columns: {list(df.columns)} and shape {df.shape}"
+
+
+def _read_spreadsheet_to_df(path: str, sheet_name=0) -> pd.DataFrame:
+    """Read a spreadsheet file into a pandas DataFrame.
+
+    Supports: CSV, TSV, XLSX, XLSM, XLS, XLSB, ODS.
+    Requires corresponding engines: openpyxl, xlrd, pyxlsb, odf.
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+
+    if ext == ".csv":
+        return pd.read_csv(path)
+    if ext == ".tsv":
+        return pd.read_csv(path, sep="\t")
+
+    # Excel / spreadsheet formats
+    if ext in (".xlsx", ".xlsm"):
+        return pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    if ext == ".xls":
+        return pd.read_excel(path, sheet_name=sheet_name, engine="xlrd")
+    if ext == ".xlsb":
+        return pd.read_excel(path, sheet_name=sheet_name, engine="pyxlsb")
+    if ext == ".ods":
+        return pd.read_excel(path, sheet_name=sheet_name, engine="odf")
+
+    raise ValueError(f"Unsupported spreadsheet format: {ext}")
+
+
+@tool
+def load_spreadsheet(path: str, sheet_name: int = 0) -> str:
+    """Load a spreadsheet (many formats) and return column info."""
+    try:
+        df = _read_spreadsheet_to_df(path, sheet_name=sheet_name)
+    except Exception as e:
+        return f"Failed to load spreadsheet: {e}"
+
+    return f"Loaded {path} with columns: {list(df.columns)} and shape {df.shape}"
 
 
 @tool
@@ -238,5 +277,5 @@ llm = ChatGroq(
 )
 
 # Bind tools to the LLM - this is required for the LLM to know about and call tools
-tools_list = [describe_dataframe, generate_chart]
+tools_list = [describe_dataframe, generate_chart, load_spreadsheet]
 llm_with_tool = llm.bind_tools(tools_list)
