@@ -164,66 +164,69 @@ def _clean_plotly_json(plot_dict: dict) -> dict:
     """
     import copy
     import numpy as np
-    
+    import pandas as pd
+
     cleaned = copy.deepcopy(plot_dict)
-    
-    def convert_to_list(data):
-        """Convert data to list format for JSON serialization."""
-        if isinstance(data, list):
-            # Recursively convert any numpy arrays in the list
-            return [convert_to_list(item) for item in data]
-        elif isinstance(data, np.ndarray):
-            return data.tolist()
-        elif isinstance(data, (np.integer, np.floating)):
-            return data.item()
-        elif isinstance(data, dict):
-            # Recursively clean dict
-            return {k: convert_to_list(v) for k, v in data.items()}
-        elif isinstance(data, tuple):
-            return [convert_to_list(item) for item in data]
-        else:
-            return data
-    
-    # Clean data traces
-    if "data" in cleaned:
-        for trace in cleaned["data"]:
-            # Convert x and y to lists
-            if "x" in trace:
-                trace["x"] = convert_to_list(trace["x"])
-            
-            if "y" in trace:
-                trace["y"] = convert_to_list(trace["y"])
-            
-            # Convert other array fields
-            for field in ["z", "text", "customdata", "ids"]:
-                if field in trace:
-                    trace[field] = convert_to_list(trace[field])
-            
-            # Remove unnecessary fields that Plotly React doesn't need
-            unnecessary_fields = ["uid", "ids", "customdata", "meta", "selectedpoints", "error_x", "error_y"]
-            for field in unnecessary_fields:
-                if field in trace:
-                    del trace[field]
-            
-            # Simplify marker if it exists
-            if "marker" in trace and isinstance(trace["marker"], dict):
-                if "pattern" in trace["marker"] and isinstance(trace["marker"]["pattern"], dict):
-                    if not trace["marker"]["pattern"] or trace["marker"]["pattern"].get("shape") == "":
-                        del trace["marker"]["pattern"]
-    
+
+    def normalize(obj):
+        """Recursively convert numpy/pandas types to native Python types suitable for JSON.
+
+        Handles: np.ndarray, np.integer, np.floating, pd.Series, pd.Index, tuples, and nested dicts/lists.
+        """
+        # numpy arrays -> lists
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+
+        # numpy scalar types
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+
+        # pandas Series / Index
+        if isinstance(obj, (pd.Series, pd.Index)):
+            return obj.tolist()
+
+        # dict -> recurse
+        if isinstance(obj, dict):
+            return {k: normalize(v) for k, v in obj.items()}
+
+        # list/tuple -> recurse
+        if isinstance(obj, list):
+            return [normalize(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [normalize(v) for v in obj]
+
+        # fallback: return as-is
+        return obj
+
+    # Fully normalize the cleaned dict
+    cleaned = normalize(cleaned)
+
+    # Remove specific unnecessary fields from traces/layouts
+    if isinstance(cleaned, dict) and "data" in cleaned:
+        for trace in cleaned.get("data", []):
+            if isinstance(trace, dict):
+                # Remove unnecessary fields that Plotly React doesn't need
+                unnecessary_fields = ["uid", "ids", "customdata", "meta", "selectedpoints", "error_x", "error_y"]
+                for field in unnecessary_fields:
+                    if field in trace:
+                        trace.pop(field, None)
+
+                # Simplify marker.pattern if empty
+                marker = trace.get("marker")
+                if isinstance(marker, dict):
+                    pattern = marker.get("pattern")
+                    if isinstance(pattern, dict) and (not pattern or pattern.get("shape") == ""):
+                        marker.pop("pattern", None)
+
     # Clean layout
-    if "layout" in cleaned:
-        layout = cleaned["layout"]
-        # Remove template reference if empty
+    if isinstance(cleaned, dict) and "layout" in cleaned:
+        layout = cleaned.get("layout") or {}
         if "template" in layout and (not layout["template"] or layout["template"] == {}):
-            del layout["template"]
-        
-        # Remove unnecessary layout fields
+            layout.pop("template", None)
         unnecessary_layout_fields = ["autosize", "dragmode", "hovermode", "selectdirection", "uirevision"]
         for field in unnecessary_layout_fields:
-            if field in layout:
-                del layout[field]
-    
+            layout.pop(field, None)
+
     return cleaned
 
 

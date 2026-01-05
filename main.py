@@ -20,6 +20,7 @@ import pandas as pd
 import json
 import re, io
 from langchain_core.messages import ToolMessage
+import ast
 
 from src.injestion import store_file_and_register_dataset
 from src.tools import describe_dataframe, llm_with_tool, load_csv, generate_chart
@@ -243,7 +244,16 @@ def extract_plots_node(state: AnalysisState):
         try:
             # Parse the tool result - it could be a dict or JSON string
             if isinstance(msg.content, str):
-                result = json.loads(msg.content)
+                try:
+                    result = json.loads(msg.content)
+                except json.JSONDecodeError:
+                    # Fallback: tool may have returned a Python dict string (single quotes)
+                    # Try ast.literal_eval which can parse Python literal dicts
+                    try:
+                        result = ast.literal_eval(msg.content)
+                    except Exception:
+                        print("Failed to parse tool string with json or ast.literal_eval")
+                        continue
             elif isinstance(msg.content, dict):
                 result = msg.content
             else:
@@ -403,10 +413,11 @@ from fastapi import Body
 @app.post("/api/chat", response_model=ChatResponseV2)
 async def analyze_chat(request: ChatRequest = Body(...)):
 
+
     try:
-        print(request)
+        print("This is the data from frontned", request)
         # Determine session id early so we can persist/restore dataset association
-        session_id = request.session_id or str(uuid.uuid4())
+        session_id = request.session_id
 
         # If requested, reset any session state
         if request.reset_session and request.session_id:
@@ -416,6 +427,7 @@ async def analyze_chat(request: ChatRequest = Body(...)):
         dataset_id = None
 
         # Handle S3 file ingestion (new upload overrides stored dataset for session)
+        print(request.input_data, "\n\n")
         if request.input_data:
             for item in request.input_data:
                 # support both dicts and Pydantic InputData objects
@@ -451,6 +463,34 @@ async def analyze_chat(request: ChatRequest = Body(...)):
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
         query = HumanMessage(content=request.user_query.strip())
+
+
+        # Short-ack shortcut: handle brief acknowledgements locally to avoid
+        # invoking the LLM/graph and prevent system messages leaking to frontend.
+        ack_pattern = r"^\s*(ok|okay|thanks|thank you|thx|got it|sounds good|bye)\b[.!\s]*$"
+        if re.match(ack_pattern, request.user_query.strip(), flags=re.IGNORECASE):
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            user_message = {
+                "id": str(uuid.uuid4()),
+                "role": "USER",
+                "content": request.user_query.strip(),
+                "createdAt": now_iso
+            }
+            assistant_message = {
+                "id": str(uuid.uuid4()),
+                "role": "ASSISTANT",
+                "content": "You're welcome — let me know if you'd like anything else.",
+                "charts": [],
+                "references": [],
+                "inputData": [],
+                "createdAt": now_iso
+            }
+            return ChatResponseV2(
+                sessionId=session_id,
+                user=UserMessage(**user_message),
+                assistant=AssistantMessage(**assistant_message)
+            )
+
 
         # Invoke state graph with the (possibly restored) dataset_id
         invoke_state = {
