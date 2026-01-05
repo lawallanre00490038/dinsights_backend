@@ -1,5 +1,3 @@
-from nt import pipe
-from uuid import uuid4
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from pandas.core.frame import DataFrame
